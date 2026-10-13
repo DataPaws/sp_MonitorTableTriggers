@@ -3,7 +3,7 @@ This is a free tool from **[DataPaws](https://datapawsconsulting.com)** for SQL 
 
 # Requirements
 - SQL Server 2017+
-
+- Database Mail (For alerts)
 # What does sp_MonitorTableTriggers do?
 - Monitors the status of table triggers in specified databases
 - Automatically logs when specified triggers are disabled or missing to a configurable table for historical tracking (7 day default retention)
