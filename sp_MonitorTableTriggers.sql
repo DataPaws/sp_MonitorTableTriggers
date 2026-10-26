@@ -168,7 +168,6 @@ BEGIN TRY
         END
     END
 
-    /* Logging table */
     IF @LoggingTable IS NOT NULL
     BEGIN
         SET @LoggingTable =
@@ -234,7 +233,6 @@ BEGIN TRY
         [CollectionTime]    datetime2(0) NOT NULL DEFAULT(GETDATE())
     );
 
-    /* Load active configuration */
     SET @SQL = N'
     INSERT INTO #Config (DatabaseName, SchemaName, TableName, TriggerName)
     SELECT database_name, schema_name, table_name, trigger_name
@@ -255,7 +253,6 @@ BEGIN TRY
         RETURN;
     END
 
-    /* Check each configured trigger */
     DECLARE TriggerCursor CURSOR LOCAL FAST_FORWARD FOR
         SELECT [DatabaseName], [SchemaName], [TableName], [TriggerName]
         FROM #Config
@@ -359,7 +356,6 @@ BEGIN TRY
     CLOSE TriggerCursor;
     DEALLOCATE TriggerCursor;
 
-    /* Logging */
     IF @LoggingTable IS NOT NULL
     BEGIN
         SET @SQL = N'
@@ -399,7 +395,6 @@ BEGIN TRY
         END
     END
 
-    /* Email alert */
     IF @EmailAlerts = 1
     BEGIN
         IF EXISTS (SELECT 1 FROM #TriggerStatus)
