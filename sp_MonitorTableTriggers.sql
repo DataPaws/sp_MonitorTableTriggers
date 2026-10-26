@@ -1,7 +1,7 @@
 USE [DBAdmin]
 GO
 
-CREATE OR ALTER PROCEDURE [dbo].[sp_MonitorTableTriggers]
+CREATE OR ALTER PROCEDURE dbo.sp_MonitorTableTriggers
 (
     @ConfigTable            NVARCHAR(4000) = 'dbo.MonitorTableTriggersConfig',
     @LoggingTable           NVARCHAR(4000) = 'dbo.MonitorTableTriggers',
@@ -17,17 +17,18 @@ AS
 BEGIN
 /*
 sp_MonitorTableTriggers by DataPaws
-Version: v1.0.0 - 10/13/2026
+Version: v1.1.0 - 10/26/2026
 GitHub: https://github.com/DataPaws/sp_MonitorTableTriggers
 
 Description:
     Monitors specified table triggers across databases and sends an email
-    alert when specified triggers become disabled or cannot be found.
+    alert when specified triggers are disabled, cannot be found, or cannot
+    be checked because the database is unavailable.
 
 Parameters:
     @ConfigTable                    Table containing triggers to monitor
-    @LoggingTable                   NULL = Disabled, Specify a table to enable logging of disabled triggers - Table can be specified in one, two, or three-part format
-    @EmailAlerts                    0 = Disabled, 1 = Send an email alert when disabled or missing triggers are detected
+    @LoggingTable                   NULL = Disabled, Specify a table to enable logging of detected issues - Table can be specified in one, two, or three-part format
+    @EmailAlerts                    0 = Disabled, 1 = Send an email alert when issues are detected
     @EmailSubject                   NULL = default of 'ServerName - Table Trigger Alerts'
     @EmailRecipients                NULL = default of the email assigned to the SQL Agent Operator, Comma-separated email addresses
     @DBMailProfileName              Database Mail profile for sending alerts - default: SQLAlertsProfile
@@ -42,6 +43,14 @@ Configuration Table Columns:
     trigger_name               Trigger to monitor
     is_active                  0 = Disabled, 1 = Actively monitor trigger
     created_date               Date configuration row was added
+
+Status Values:
+    DISABLED        Trigger exists but is disabled
+    MISSING         Database is accessible but the trigger was not found
+    DB_MISSING      Database does not exist on this server
+    DB_OFFLINE      Database exists but is not ONLINE (offline, restoring, recovering, suspect, etc.)
+    NO_ACCESS       Database is ONLINE but is not accessible (permissions, non-readable AG secondary, etc.)
+    ERROR           Unexpected error while checking the trigger
 
 Examples:
     INSERT INTO dbo.MonitorTableTriggersConfig
@@ -76,12 +85,15 @@ BEGIN TRY
     SET NOCOUNT ON;
 
     DECLARE
-        @SQL                NVARCHAR(MAX),
-        @CheckTemplate      NVARCHAR(MAX),
-        @MissingDbTemplate  NVARCHAR(MAX),
-        @GeneratedSQL       NVARCHAR(MAX),
-        @Recipients         NVARCHAR(MAX),
-        @Body               NVARCHAR(MAX);
+        @SQL            NVARCHAR(MAX),
+        @Recipients     NVARCHAR(MAX),
+        @Body           NVARCHAR(MAX),
+        @DatabaseName   sysname,
+        @SchemaName     sysname,
+        @TableName      sysname,
+        @TriggerName    sysname,
+        @DbState        NVARCHAR(60),
+        @Status         VARCHAR(20);
 
     IF @ConfigTable IS NULL
     BEGIN
@@ -91,7 +103,7 @@ BEGIN TRY
 
     IF @EmailSubject IS NULL
     BEGIN
-        SET @EmailSubject = @@SERVERNAME + ' - Table Triggers Disabled';
+        SET @EmailSubject = @@SERVERNAME + ' - Table Trigger Alerts';
     END
 
     IF @EmailRecipients IS NULL
@@ -109,6 +121,7 @@ BEGIN TRY
         RETURN;
     END
 
+    /* Configuration table */
     SET @ConfigTable =
         COALESCE(QUOTENAME(PARSENAME(@ConfigTable, 3)) + '.', '') +
         COALESCE(QUOTENAME(PARSENAME(@ConfigTable, 2)) + '.', '') +
@@ -123,7 +136,7 @@ BEGIN TRY
     IF OBJECT_ID(@ConfigTable) IS NULL
     BEGIN
         SET @SQL = N'
-        CREATE TABLE ' + @ConfigTable + '
+        CREATE TABLE ' + @ConfigTable + N'
         (
             configuration_id INT IDENTITY(1,1) PRIMARY KEY,
             database_name sysname NOT NULL,
@@ -135,7 +148,7 @@ BEGIN TRY
         );
 
         CREATE UNIQUE NONCLUSTERED INDEX IX_Database_Schema_Table_Trigger
-        ON ' + @ConfigTable + '
+        ON ' + @ConfigTable + N'
         (
             database_name,
             schema_name,
@@ -151,10 +164,11 @@ BEGIN TRY
         END
         ELSE
         BEGIN
-            EXEC sp_executesql @SQL;
+            EXEC sys.sp_executesql @SQL;
         END
     END
 
+    /* Logging table */
     IF @LoggingTable IS NOT NULL
     BEGIN
         SET @LoggingTable =
@@ -171,18 +185,18 @@ BEGIN TRY
         IF OBJECT_ID(@LoggingTable) IS NULL
         BEGIN
             SET @SQL = N'
-            CREATE TABLE ' + @LoggingTable + '
+            CREATE TABLE ' + @LoggingTable + N'
             (
-                DatabaseName    sysname      NOT NULL,
-                SchemaName      sysname      NOT NULL,
-                TableName       sysname      NOT NULL,
-                TriggerName     sysname      NOT NULL,
-                IsDisabled      bit          NOT NULL,
-                CollectionTime  datetime2(0) NOT NULL
+                [DatabaseName]      sysname      NOT NULL,
+                [SchemaName]        sysname      NOT NULL,
+                [TableName]         sysname      NOT NULL,
+                [TriggerName]       sysname      NOT NULL,
+                [Status]            varchar(20)  NOT NULL,
+                [CollectionTime]    datetime2(0) NOT NULL
             );
 
             CREATE CLUSTERED INDEX CX_CollectionTime
-                ON ' + @LoggingTable + '(CollectionTime);
+                ON ' + @LoggingTable + N'(CollectionTime);
             ';
 
             IF @Debug = 1
@@ -191,7 +205,7 @@ BEGIN TRY
             END
             ELSE
             BEGIN
-                EXEC sp_executesql @SQL;
+                EXEC sys.sp_executesql @SQL;
             END
         END
     END
@@ -202,138 +216,173 @@ BEGIN TRY
         RETURN;
     END
 
-    CREATE TABLE #TriggerStatus
+    CREATE TABLE #Config
     (
-        DatabaseName    sysname         NOT NULL,
-        SchemaName      sysname         NOT NULL,
-        TableName       sysname         NOT NULL,
-        TriggerName     sysname         NOT NULL,
-        [Status]        varchar(8)      NOT NULL,   -- DISABLED or MISSING
-        CollectionTime  datetime2(0)    NOT NULL DEFAULT(GETDATE())
+        [DatabaseName]  sysname NOT NULL,
+        [SchemaName]    sysname NOT NULL,
+        [TableName]     sysname NOT NULL,
+        [TriggerName]   sysname NOT NULL
     );
 
-    SET @CheckTemplate = N'
-	INSERT INTO #TriggerStatus (DatabaseName, SchemaName, TableName, TriggerName, [Status])
-	SELECT
-		N{db_lit},
-		N{schema_lit},
-		N{table_lit},
-		N{trigger_lit},
-		CASE WHEN t.[object_id] IS NULL THEN ''MISSING'' ELSE ''DISABLED'' END
-	FROM (SELECT 1 AS x) AS d
-	LEFT JOIN
-	(
-		SELECT tr.[object_id], tr.is_disabled
-		FROM {db_q}.sys.triggers AS tr
-		INNER JOIN {db_q}.sys.objects AS o
-			ON o.[object_id] = tr.parent_id
-		INNER JOIN {db_q}.sys.schemas AS s
-			ON s.[schema_id] = o.[schema_id]
-		WHERE tr.[name] = N{trigger_lit}
-		  AND tr.parent_class = 1
-		  AND o.[name] = N{table_lit}
-		  AND s.[name] = N{schema_lit}
-	) AS t
-		ON 1 = 1
-	WHERE t.[object_id] IS NULL
-	   OR t.is_disabled = 1;
-	';
-
-
-    SET @MissingDbTemplate = N'
-	INSERT INTO #TriggerStatus (DatabaseName, SchemaName, TableName, TriggerName, [Status])
-	VALUES (N{db_lit}, N{schema_lit}, N{table_lit}, N{trigger_lit}, ''MISSING'');
-	';
-
-    SET @SQL = N'
-    SELECT @GeneratedSQL =
-        STRING_AGG
-        (
-            CAST(
-                REPLACE(
-                REPLACE(
-                REPLACE(
-                REPLACE(
-                REPLACE(
-                    x.template,
-                    N''{db_q}'',        QUOTENAME(c.database_name)),
-                    N''{db_lit}'',      QUOTENAME(c.database_name, '''''''')),
-                    N''{schema_lit}'',  QUOTENAME(c.schema_name, '''''''')),
-                    N''{table_lit}'',   QUOTENAME(c.table_name, '''''''')),
-                    N''{trigger_lit}'', QUOTENAME(c.trigger_name, ''''''''))
-            AS NVARCHAR(MAX)),
-            NCHAR(13) + NCHAR(10)
-        )
-    FROM ' + @ConfigTable + N' AS c
-    CROSS APPLY
+    CREATE TABLE #TriggerStatus
     (
-        SELECT
-            CASE
-                WHEN EXISTS
-                (
-                    SELECT 1
-                    FROM sys.databases AS d
-                    WHERE d.[name] = c.database_name
-                      AND d.[state] = 0
-                )
-                THEN @CheckTemplate
-                ELSE @MissingDbTemplate
-            END AS template
-    ) AS x
-    WHERE c.is_active = 1;
+        [DatabaseName]      sysname      NOT NULL,
+        [SchemaName]        sysname      NOT NULL,
+        [TableName]         sysname      NOT NULL,
+        [TriggerName]       sysname      NOT NULL,
+        [Status]            varchar(20)  NOT NULL,
+        [CollectionTime]    datetime2(0) NOT NULL DEFAULT(GETDATE())
+    );
+
+    /* Load active configuration */
+    SET @SQL = N'
+    INSERT INTO #Config (DatabaseName, SchemaName, TableName, TriggerName)
+    SELECT database_name, schema_name, table_name, trigger_name
+    FROM ' + @ConfigTable + N'
+    WHERE is_active = 1;
     ';
 
     IF @Debug = 1
     BEGIN
-        PRINT @SQL + NCHAR(10);
+        PRINT @SQL;
     END
 
-    EXEC sp_executesql
-        @SQL,
-        N'@CheckTemplate NVARCHAR(MAX), @MissingDbTemplate NVARCHAR(MAX), @GeneratedSQL NVARCHAR(MAX) OUTPUT',
-        @CheckTemplate = @CheckTemplate,
-        @MissingDbTemplate = @MissingDbTemplate,
-        @GeneratedSQL = @GeneratedSQL OUTPUT;
+    EXEC sys.sp_executesql @SQL;
 
-    IF @GeneratedSQL IS NULL
+    IF NOT EXISTS (SELECT 1 FROM #Config)
     BEGIN
         PRINT 'No active triggers are configured for monitoring.';
         RETURN;
     END
 
-    IF @Debug = 1
+    /* Check each configured trigger */
+    DECLARE TriggerCursor CURSOR LOCAL FAST_FORWARD FOR
+        SELECT [DatabaseName], [SchemaName], [TableName], [TriggerName]
+        FROM #Config
+        ORDER BY [DatabaseName], [SchemaName], [TableName], [TriggerName];
+
+    OPEN TriggerCursor;
+
+    FETCH NEXT FROM TriggerCursor
+    INTO @DatabaseName, @SchemaName, @TableName, @TriggerName;
+
+    WHILE @@FETCH_STATUS = 0
     BEGIN
-        PRINT @GeneratedSQL + NCHAR(10);
-    END
-    ELSE
-    BEGIN
-        EXEC sp_executesql @GeneratedSQL;
+        SET @Status  = NULL;
+        SET @DbState = NULL;
+
+        BEGIN TRY
+
+            SELECT @DbState = d.[state_desc]
+            FROM sys.databases AS d
+            WHERE d.[name] = @DatabaseName;
+
+            IF @DbState IS NULL
+            BEGIN
+                SET @Status = 'DB_MISSING';
+            END
+            ELSE IF @DbState <> N'ONLINE'
+            BEGIN
+                SET @Status = 'DB_OFFLINE';
+            END
+            ELSE IF COALESCE(HAS_DBACCESS(@DatabaseName), 0) = 0
+            BEGIN
+                SET @Status = 'NO_ACCESS';
+            END
+
+            IF @Status IS NOT NULL
+            BEGIN
+                -- Database is unavailable, the trigger can't be checked
+                INSERT INTO #TriggerStatus (DatabaseName, SchemaName, TableName, TriggerName, [Status])
+                VALUES (@DatabaseName, @SchemaName, @TableName, @TriggerName, @Status);
+            END
+            ELSE
+            BEGIN
+                SET @SQL = N'
+                INSERT INTO #TriggerStatus (DatabaseName, SchemaName, TableName, TriggerName, [Status])
+                SELECT
+                    @DatabaseName,
+                    @SchemaName,
+                    @TableName,
+                    @TriggerName,
+                    CASE WHEN t.[object_id] IS NULL THEN ''MISSING'' ELSE ''DISABLED'' END
+                FROM (SELECT 1 AS x) AS d
+                LEFT JOIN
+                (
+                    SELECT tr.[object_id], tr.is_disabled
+                    FROM ' + QUOTENAME(@DatabaseName) + N'.sys.triggers AS tr
+                    INNER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.objects AS o
+                        ON o.[object_id] = tr.parent_id
+                    INNER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.schemas AS s
+                        ON s.[schema_id] = o.[schema_id]
+                    WHERE tr.[name] = @TriggerName
+                      AND tr.parent_class = 1
+                      AND o.[name] = @TableName
+                      AND s.[name] = @SchemaName
+                ) AS t
+                    ON 1 = 1
+                WHERE t.[object_id] IS NULL
+                   OR t.is_disabled = 1;
+                ';
+
+                IF @Debug = 1
+                BEGIN
+                    PRINT @SQL;
+                END
+                ELSE
+                BEGIN
+                    EXEC sys.sp_executesql
+                        @SQL,
+                        N'@DatabaseName sysname, @SchemaName sysname, @TableName sysname, @TriggerName sysname',
+                        @DatabaseName = @DatabaseName,
+                        @SchemaName   = @SchemaName,
+                        @TableName    = @TableName,
+                        @TriggerName  = @TriggerName;
+                END
+            END
+
+        END TRY
+        BEGIN CATCH
+
+            INSERT INTO #TriggerStatus (DatabaseName, SchemaName, TableName, TriggerName, [Status])
+            VALUES (@DatabaseName, @SchemaName, @TableName, @TriggerName, 'ERROR');
+
+            PRINT 'Error checking ' + QUOTENAME(@DatabaseName) + '.' + QUOTENAME(@SchemaName) + '.' + QUOTENAME(@TableName)
+                + ' / ' + QUOTENAME(@TriggerName) + ': ' + ERROR_MESSAGE();
+
+        END CATCH
+
+        FETCH NEXT FROM TriggerCursor
+        INTO @DatabaseName, @SchemaName, @TableName, @TriggerName;
     END
 
+    CLOSE TriggerCursor;
+    DEALLOCATE TriggerCursor;
+
+    /* Logging */
     IF @LoggingTable IS NOT NULL
     BEGIN
         SET @SQL = N'
-        INSERT INTO ' + @LoggingTable + '
+        INSERT INTO ' + @LoggingTable + N'
         (
-            DatabaseName,
-            SchemaName,
-            TableName,
-            TriggerName,
-            IsDisabled,
-            CollectionTime
+            [DatabaseName],
+            [SchemaName],
+            [TableName],
+            [TriggerName],
+            [Status],
+            [CollectionTime]
         )
         SELECT
-            DatabaseName,
-            SchemaName,
-            TableName,
-            TriggerName,
-            1,
-            GETDATE()
-        FROM #TriggerStatus
-        WHERE [Status] = ''DISABLED'';
+            [DatabaseName],
+            [SchemaName],
+            [TableName],
+            [TriggerName],
+            [Status],
+            [CollectionTime]
+        FROM #TriggerStatus;
 
         DELETE
-        FROM ' + @LoggingTable + '
+        FROM ' + @LoggingTable + N'
         WHERE CollectionTime < DATEADD(DAY, -@RetentionDays, GETDATE());
         ';
 
@@ -343,13 +392,14 @@ BEGIN TRY
         END
         ELSE
         BEGIN
-            EXEC sp_executesql
+            EXEC sys.sp_executesql
                 @SQL,
                 N'@RetentionDays INT',
                 @RetentionDays = @RetentionDays;
         END
     END
 
+    /* Email alert */
     IF @EmailAlerts = 1
     BEGIN
         IF EXISTS (SELECT 1 FROM #TriggerStatus)
@@ -374,9 +424,20 @@ BEGIN TRY
                     N'<td>' + e.[TableName] + N'</td>' +
                     N'<td>' + e.[TriggerName] + N'</td>' +
                     N'<td style="background-color:' +
-                        CASE e.[Status] WHEN 'DISABLED' THEN N'#f8d7da' ELSE N'#fff3cd' END +
+                        CASE e.[Status]
+                            WHEN 'DISABLED' THEN N'#f8d7da'
+                            WHEN 'MISSING'  THEN N'#fff3cd'
+                            ELSE N'#ffe5d0'
+                        END +
                         N';">' +
-                        CASE e.[Status] WHEN 'DISABLED' THEN N'Disabled' ELSE N'Not Found' END + N'</td>' +
+                        CASE e.[Status]
+                            WHEN 'DISABLED'   THEN N'Trigger Disabled'
+                            WHEN 'MISSING'    THEN N'Trigger Not Found'
+                            WHEN 'DB_MISSING' THEN N'Database Not Found'
+                            WHEN 'DB_OFFLINE' THEN N'Database Not Online'
+                            WHEN 'NO_ACCESS'  THEN N'Database Inaccessible'
+                            ELSE N'Error Checking Trigger'
+                        END + N'</td>' +
                     N'<td>' + CONVERT(NVARCHAR(19), e.[CollectionTime], 120) + N'</td>' +
                     N'</tr>'
                 FROM
