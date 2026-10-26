@@ -121,7 +121,6 @@ BEGIN TRY
         RETURN;
     END
 
-    /* Configuration table */
     SET @ConfigTable =
         COALESCE(QUOTENAME(PARSENAME(@ConfigTable, 3)) + '.', '') +
         COALESCE(QUOTENAME(PARSENAME(@ConfigTable, 2)) + '.', '') +
